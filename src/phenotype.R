@@ -1,18 +1,27 @@
 library(dplyr)
 library(readr)
 source("src/clone_expansion_plots.R")
+source("src/customized plots.R")
 library(ggplot2)
 library(Seurat)
 library(SeuratDisk)
+library(wesanderson)
 
 sc_data <- read_csv(file = 'data/scTCR_data_merge.csv') %>%
   mutate(seurat_clusters = as.character(seurat_clusters))
 clone_exp <- read_csv(file = 'data/clone_expansion.csv')
 obj <- LoadH5Seurat('data/seurat_results.h5Seurat')
 cell_type <- read_csv('data/cell_types.csv')
+sample_info <- read_csv('data/babyAIM_sample_info.csv')
 rownames(cell_type) <- cell_type$unique_index
 obj$cell_type <- cell_type$cell_type
 obj$Sample_Name <- as.factor(obj$Sample_Name)
+
+
+## temp
+# add time point info
+
+##
 
 ## all cells
 
@@ -139,45 +148,122 @@ freq_barplot_AIMpos_and_expanded_by_sample(d1 %>% filter(seurat_clusters=='10'),
 ggsave('figures/AIMpos_Tregs_frequency_by_sample.pdf')
 
 
-# top clone phenotype
-top_clone_id <- get_top_expansion_id(clone_exp, 10)
-data <- sc_data %>% filter(clone_id %in% top_clone_id)
-#obj <- ScaleData(obj)
 
-obj_exp <- subset(obj, subset = unique_index %in% data$unique_index)
-obj_exp <- ScaleData(obj_exp)
+## AIMpos per marker
+df_AIMpos <- lapply(AIM_gene_list, function(AIM_marker){
+  obj_tmp <- subset(obj, subset = !!sym(AIM_marker)>1)
+  tmp <- tibble(unique_index = obj_tmp$unique_index)
+  tmp[, AIM_marker] <- 1
+  return(tmp)
+}) %>% Reduce(f = full_join)
+meta_AIMpos <- obj[[]] %>% left_join(df_AIMpos, by='unique_index') %>% 
+  mutate(across(all_of(AIM_gene_list),~tidyr::replace_na(.x, 0)))
 
-FeaturePlot(obj_exp, features = c('CD3E', 'CD4', 'CD8A', 'ITGAE'))
+# for Tregs (cluster 10)
+df <- lapply(AIM_gene_list, function(AIM_marker){
+  meta_AIMpos %>% filter(seurat_clusters == '10') %>% 
+    group_by(Sample_Name, !!sym(AIM_marker)) %>% 
+    tally() %>%
+    ungroup() %>%
+    tidyr::complete(Sample_Name, !!sym(AIM_marker), fill = list(n=0)) %>%
+    group_by(Sample_Name) %>%
+    mutate(freq = n/sum(n)) %>% 
+    filter(!!sym(AIM_marker)==1) %>%
+    rename(AIM = !!sym(AIM_marker)) %>%
+    mutate(AIM = AIM_marker)
+}) %>% do.call(what = rbind)
+tmp <- df %>% 
+  filter(!(Sample_Name %in% c('BabyAIM_2', 'BabyAIM_4'))) %>%
+  left_join(sample_info, by='Sample_Name') %>%
+  mutate(label = if_else(Sample_Name == 'BabyAIM_1' | source=='Mother', AIM, NA_character_)) %>%
+  filter(AIM != 'IL2RA') # CD25 is a Treg marker so it's not induced by activation
+labeled_line_graph(data = tmp, 
+                   aes_line = aes(x=timepoint, y=freq, group=AIM, color=AIM, label = label),
+                   ref = list(source='Mother'),
+                   padding = 0.15) +
+  ylab('Frequency among Tregs') + 
+  ggtitle('Frequency changes of each AIM')
+ggsave('figures/eachAIM_Tregs_frequency_by_sample.pdf')
 
-tmp <- obj_exp[[]] %>% left_join(data, by = 'unique_index')
-obj_exp$clone_id <- tmp$clone_id
-Idents(obj_exp) <- 'clone_id'
-all_features <- FindAllMarkers(obj_exp)
-top_features <- all_features %>% 
-  group_by(cluster) %>% 
-  slice_max(n=10, order_by = avg_log2FC)
-DimPlot(obj_exp, group.by = 'clone_id')
+# for non-Treg CD4 T
+df <- lapply(AIM_gene_list, function(AIM_marker){
+  meta_AIMpos %>% 
+    filter(seurat_clusters != '10',
+           cell_type == 'CD4T') %>% 
+    group_by(Sample_Name, !!sym(AIM_marker)) %>% 
+    tally() %>%
+    ungroup() %>%
+    tidyr::complete(Sample_Name, !!sym(AIM_marker), fill = list(n=0)) %>%
+    group_by(Sample_Name) %>%
+    mutate(freq = n/sum(n)) %>% 
+    filter(!!sym(AIM_marker)==1) %>%
+    rename(AIM = !!sym(AIM_marker)) %>%
+    mutate(AIM = AIM_marker)
+}) %>% do.call(what = rbind)
+tmp <- df %>% 
+  filter(!(Sample_Name %in% c('BabyAIM_2', 'BabyAIM_4'))) %>%
+  left_join(sample_info, by='Sample_Name') %>%
+  mutate(label = if_else(timepoint == min(sample_info$timepoint) | source=='Mother', AIM, NA_character_))
+labeled_line_graph(data = tmp, 
+                   aes_line = aes(x=timepoint, y=freq, group=AIM, color=AIM, label = label),
+                   ref = list(source='Mother'),
+                   padding = 0.15) +
+  ylab('Frequency among non-Treg CD4T cells') + 
+  ggtitle('Frequency changes of each AIM')
+ggsave('figures/eachAIM_nonTregsCD4_frequency_by_sample.pdf')
 
-tmp <- GetAssayData(obj_exp, slot = 'scale.data')
-d <- hclust(dist(tmp[unique(top_features$gene),], method = 'euclidean'), method = 'average')
-DoHeatmap(obj_exp, group.by = 'clone_id', features = c(d$labels[d$order]))
-ggsave('figures/top_clone_phenotype.pdf', width = 15, height = 10, units = 'in')
 
-# search for CD8 T with high CD39 and CD11b and their clone expansions
 
-top_clone_id <- get_top_expansion_id(clone_exp %>% filter(grepl('ISAC99', Sample_Name)), 20)
-data <- sc_data %>% filter(clone_id %in% top_clone_id)
-obj_exp <- subset(obj, subset = unique_index %in% data$unique_index)
-FeaturePlot(obj_exp, features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM'))
-FeaturePlot(obj, features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM'))
-ggsave('figures/all_cells_CD39_CD11b.pdf')
 
-tmp <- obj_exp[[]] %>% left_join(data, by = 'unique_index')
-obj_exp$clone_id <- tmp$clone_id
-Idents(obj_exp) <- 'clone_id'
-DoHeatmap(obj_exp, slot='data', group.by = 'clone_id', features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM')) + 
-  scale_fill_gradientn(colors = c("black", "yellow"))
-ggsave('figures/ISAC99_CD39_CD11b_top_clones.pdf', width = 15, height = 5, units = 'in')
+
+
+
+
+
+
+
+# 
+# ##
+# 
+# # top clone phenotype
+# top_clone_id <- get_top_expansion_id(clone_exp, 10)
+# data <- sc_data %>% filter(clone_id %in% top_clone_id)
+# #obj <- ScaleData(obj)
+# 
+# obj_exp <- subset(obj, subset = unique_index %in% data$unique_index)
+# obj_exp <- ScaleData(obj_exp)
+# 
+# FeaturePlot(obj_exp, features = c('CD3E', 'CD4', 'CD8A', 'ITGAE'))
+# 
+# tmp <- obj_exp[[]] %>% left_join(data, by = 'unique_index')
+# obj_exp$clone_id <- tmp$clone_id
+# Idents(obj_exp) <- 'clone_id'
+# all_features <- FindAllMarkers(obj_exp)
+# top_features <- all_features %>% 
+#   group_by(cluster) %>% 
+#   slice_max(n=10, order_by = avg_log2FC)
+# DimPlot(obj_exp, group.by = 'clone_id')
+# 
+# tmp <- GetAssayData(obj_exp, slot = 'scale.data')
+# d <- hclust(dist(tmp[unique(top_features$gene),], method = 'euclidean'), method = 'average')
+# DoHeatmap(obj_exp, group.by = 'clone_id', features = c(d$labels[d$order]))
+# ggsave('figures/top_clone_phenotype.pdf', width = 15, height = 10, units = 'in')
+# 
+# # search for CD8 T with high CD39 and CD11b and their clone expansions
+# 
+# top_clone_id <- get_top_expansion_id(clone_exp %>% filter(grepl('ISAC99', Sample_Name)), 20)
+# data <- sc_data %>% filter(clone_id %in% top_clone_id)
+# obj_exp <- subset(obj, subset = unique_index %in% data$unique_index)
+# FeaturePlot(obj_exp, features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM'))
+# FeaturePlot(obj, features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM'))
+# ggsave('figures/all_cells_CD39_CD11b.pdf')
+# 
+# tmp <- obj_exp[[]] %>% left_join(data, by = 'unique_index')
+# obj_exp$clone_id <- tmp$clone_id
+# Idents(obj_exp) <- 'clone_id'
+# DoHeatmap(obj_exp, slot='data', group.by = 'clone_id', features = c('CD3E', 'CD8A', 'ENTPD1', 'ITGAM')) + 
+#   scale_fill_gradientn(colors = c("black", "yellow"))
+# ggsave('figures/ISAC99_CD39_CD11b_top_clones.pdf', width = 15, height = 5, units = 'in')
 
 
 
